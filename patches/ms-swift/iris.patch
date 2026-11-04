@@ -1,0 +1,1102 @@
+diff --git a/swift/arguments/base_args/base_args.py b/swift/arguments/base_args/base_args.py
+index 99e6b5a1a..67a1ec089 100644
+--- a/swift/arguments/base_args/base_args.py
++++ b/swift/arguments/base_args/base_args.py
+@@ -251,6 +251,15 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
+             'problem_type',
+             'rope_scaling',
+             'max_model_len',
++            'audio_layer_aggregation',
++            'audio_layer_index',
++            'train_audio_projection',
++            'audio_weight_backend',
++            'audio_weight_init_final_prob',
++            'audio_weight_text_model',
++            'audio_weight_text_revision',
++            'train_audio_weight_text_encoder',
++            'audio_weight_document_text',
+             # quant_args
+             'quant_method',
+             'quant_bits',
+diff --git a/swift/arguments/base_args/model_args.py b/swift/arguments/base_args/model_args.py
+index 4caeed880..c1f4df6a0 100644
+--- a/swift/arguments/base_args/model_args.py
++++ b/swift/arguments/base_args/model_args.py
+@@ -92,6 +92,18 @@ class ModelArguments:
+     init_strategy: Literal['zero', 'uniform', 'normal', 'xavier_uniform', 'xavier_normal', 'kaiming_uniform',
+                            'kaiming_normal', 'orthogonal'] = None
+ 
++    # IRIS audio-encoder layer aggregation. These options are ignored by models
++    # that do not register an audio-layer aggregation backend.
++    audio_layer_aggregation: Optional[Literal['final', 'fixed', 'mean', 'learned']] = None
++    audio_layer_index: Optional[int] = None
++    train_audio_projection: Optional[bool] = None
++    audio_weight_backend: Optional[Literal['minilm', 'global']] = None
++    audio_weight_init_final_prob: Optional[float] = None
++    audio_weight_text_model: Optional[str] = None
++    audio_weight_text_revision: Optional[str] = None
++    train_audio_weight_text_encoder: Optional[bool] = None
++    audio_weight_document_text: Optional[str] = None
++
+     def _init_device_map(self):
+         """Prepare device map args"""
+         if self.device_map:
+@@ -246,4 +258,13 @@ class ModelArguments:
+             'num_labels': self.num_labels,
+             'problem_type': self.problem_type,
+             'init_strategy': self.init_strategy,
++            'audio_layer_aggregation': self.audio_layer_aggregation,
++            'audio_layer_index': self.audio_layer_index,
++            'train_audio_projection': self.train_audio_projection,
++            'audio_weight_backend': self.audio_weight_backend,
++            'audio_weight_init_final_prob': self.audio_weight_init_final_prob,
++            'audio_weight_text_model': self.audio_weight_text_model,
++            'audio_weight_text_revision': self.audio_weight_text_revision,
++            'train_audio_weight_text_encoder': self.train_audio_weight_text_encoder,
++            'audio_weight_document_text': self.audio_weight_document_text,
+         }
+diff --git a/swift/arguments/tuner_args.py b/swift/arguments/tuner_args.py
+index b742cec56..526366ad2 100644
+--- a/swift/arguments/tuner_args.py
++++ b/swift/arguments/tuner_args.py
+@@ -18,6 +18,7 @@ class TunerArguments:
+             Defaults to an empty list `[]`.
+         freeze_parameters_regex (Optional[str]): A regular expression to match the names of parameters that should be
+             frozen. Defaults to `None`.
++            For adapters, freezing runs after adapter preparation and matches wrapped parameter names.
+         freeze_parameters_ratio (float): The ratio of parameters to freeze, starting from the bottom layers upwards
+             (from 0.0 to 1.0). Setting this to 1.0 freezes all model parameters, which can be useful when selectively
+             unfreezing specific parameters with `trainable_parameters`. Defaults to 0.0.
+diff --git a/swift/loss/embedding.py b/swift/loss/embedding.py
+index 97d28f621..777e480cc 100644
+--- a/swift/loss/embedding.py
++++ b/swift/loss/embedding.py
+@@ -1,19 +1,173 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
+-import numpy as np
+ import os
++import threading
++from enum import Enum
++from typing import Callable, Dict, List, Optional
++
++import numpy as np
+ import torch
+ import torch.distributed as dist
+ import torch.nn.functional as F
+ from accelerate.utils import gather_object
+-from enum import Enum
+ from torch import nn
+ from torch.nn import MSELoss
+ from transformers.utils import strtobool
+ 
+ from swift.sequence_parallel import sequence_parallel
+-from swift.utils import get_dist_setting
++from swift.utils import get_dist_setting, get_logger
+ from .base import BaseLoss
+ 
++logger = get_logger()
++
++# ---------------------------------------------------------------------------
++# Per-batch metadata for metadata-based false-negative masking in infonce_loss.
++# The embedding collator attaches lists under INFONCE_BATCH_METADATA_KEY; Trainer
++# _prepare_inputs moves them here so they survive DataLoader worker processes
++# (thread-local alone would only work in the collator worker, not the trainer).
++# ---------------------------------------------------------------------------
++INFONCE_BATCH_METADATA_KEY = 'infonce_batch_metadata'
++
++_batch_meta_local = threading.local()
++
++
++def set_infonce_batch_metadata(metadata: List[Dict]) -> None:
++    """Store per-sample metadata for the current batch (set from Trainer._prepare_inputs)."""
++    _batch_meta_local.data = metadata
++
++
++def clear_infonce_batch_metadata() -> None:
++    """Drop any staged metadata (e.g. batches without INFONCE_BATCH_METADATA_KEY)."""
++    _batch_meta_local.data = None
++
++
++def _pop_infonce_batch_metadata() -> Optional[List[Dict]]:
++    """Retrieve and clear per-sample metadata (called by loss function)."""
++    data = getattr(_batch_meta_local, 'data', None)
++    _batch_meta_local.data = None
++    return data
++
++
++def _gather_infonce_batch_metadata(batch_metadata: Optional[List[Dict]], group=None) -> List[Dict]:
++    gathered = [None] * dist.get_world_size(group)
++    dist.all_gather_object(gathered, batch_metadata or [], group=group)
++    return [metadata for rank_metadata in gathered for metadata in rank_metadata]
++
++
++def _active_criteria(criteria: Optional[Dict]) -> Dict:
++    """Key-value pairs of *criteria* with non-None values (empty => no filtering intent)."""
++    if not criteria:
++        return {}
++    return {k: v for k, v in criteria.items() if v is not None}
++
++
++def _criteria_match(criteria: Dict, metadata: Dict) -> bool:
++    """True iff every active (non-None) key in *criteria* equals *metadata* for that key."""
++    active = _active_criteria(criteria)
++    if not active or not metadata:
++        return False
++    return all(metadata.get(k) == v for k, v in active.items())
++
++
++def _build_metadata_fn_mask(
++    batch_metadata: List[Dict],
++    block_size: int,
++    device: torch.device,
++) -> torch.Tensor:
++    """Build a ``[B, B*block_size]`` bool mask.  ``True`` = false negative.
++
++    ``block_size`` is the number of documents per sample (1 positive +
++    num_negatives).  Column ``j * block_size + 0`` is sample *j*'s positive
++    doc; ``j * block_size + k`` (k >= 1) is its *k*-th hard negative.
++    """
++    B = len(batch_metadata)
++    mask = torch.zeros(B, B * block_size, dtype=torch.bool, device=device)
++    ncols = B * block_size
++    for i in range(B):
++        criteria = batch_metadata[i].get('select_criteria') or {}
++        active = _active_criteria(criteria)
++        if not active:
++            continue
++        target_col = i * block_size  # own positive – never mask
++        for j in range(B):
++            # positive doc of sample j
++            col_pos = j * block_size
++            if col_pos != target_col:
++                pos_meta = batch_metadata[j].get('pos_doc_metadata') or {}
++                if _criteria_match(criteria, pos_meta):
++                    mask[i, col_pos] = True
++            # negative doc(s) of sample j
++            neg_metas = batch_metadata[j].get('neg_doc_metadata') or []
++            for k, neg_meta in enumerate(neg_metas):
++                col_neg = j * block_size + 1 + k
++                if col_neg < ncols and _criteria_match(criteria, neg_meta):
++                    mask[i, col_neg] = True
++    return mask
++
++
++def _build_metadata_fn_mask_flat(
++    batch_metadata: List[Dict],
++    split_sizes: List[int],
++    device: torch.device,
++) -> List[torch.Tensor]:
++    """Build per-query masks for the non-batched (variable-neg) path.
++
++    Returns a list of 1-D bool tensors, one per query, aligned with the flat
++    concatenated document tensor.
++    """
++    total_docs = sum(split_sizes)
++    # Build a flat metadata list matching the concatenated doc order
++    flat_meta: List[Dict] = []
++    for j, meta in enumerate(batch_metadata):
++        flat_meta.append(meta.get('pos_doc_metadata') or {})
++        for neg_meta in (meta.get('neg_doc_metadata') or []):
++            flat_meta.append(neg_meta)
++
++    masks = []
++    doc_offset = 0
++    for idx, meta in enumerate(batch_metadata):
++        criteria = meta.get('select_criteria') or {}
++        active = _active_criteria(criteria)
++        m = torch.zeros(total_docs, dtype=torch.bool, device=device)
++        if active:
++            target_pos = doc_offset  # own positive
++            for pos in range(total_docs):
++                if pos == target_pos:
++                    continue
++                dm = flat_meta[pos]
++                if _criteria_match(criteria, dm):
++                    m[pos] = True
++        masks.append(m)
++        doc_offset += split_sizes[idx]
++    return masks
++
++
++def _log_infonce_masked_fn_batched(
++    batch_metadata: List[Dict],
++    fn_mask: torch.Tensor,
++    block_size: int,
++    max_samples: int,
++) -> None:
++    """Log a few (query row, doc column) pairs masked as metadata false negatives."""
++    if max_samples <= 0 or not fn_mask.any():
++        return
++    nz = fn_mask.nonzero(as_tuple=False)
++    for t in range(min(max_samples, nz.shape[0])):
++        qi = int(nz[t, 0].item())
++        col = int(nz[t, 1].item())
++        j = col // block_size
++        off = col % block_size
++        crit = _active_criteria(batch_metadata[qi].get('select_criteria') or {})
++        if off == 0:
++            doc_kind = 'pos_doc'
++            doc_meta = batch_metadata[j].get('pos_doc_metadata') or {}
++        else:
++            neg_i = off - 1
++            doc_kind = f'neg_doc[{neg_i}]'
++            neg_list = batch_metadata[j].get('neg_doc_metadata') or []
++            doc_meta = neg_list[neg_i] if neg_i < len(neg_list) else {}
++        logger.info(
++            '[infonce] masked_fn: query_i=%s qd_col=%s doc_owner_j=%s %s criteria_active=%r doc_meta=%r',
++            qi, col, j, doc_kind, crit, doc_meta)
+ 
+ # Code borrowed from sentence_transformers
+ class SiameseDistanceMetric(Enum):
+@@ -169,10 +323,55 @@ class InfonceLoss(BaseLoss):
+             labels = [tensor.to(sentences.device) for tensor in labels]
+             labels = torch.stack(labels, dim=0)
+ 
++        # Every rank enters the metadata collective, regardless of its local metadata.
++        batch_metadata = _pop_infonce_batch_metadata()
++        if world_size > 1 and use_batch and infonce_mask_fake_negative:
++            if getattr(sequence_parallel, 'dp_group', None) is not None:
++                batch_metadata = sequence_parallel._gather_object_dp(batch_metadata or [])
++            elif self.is_megatron:
++                from megatron.core import mpu
++                batch_metadata = _gather_infonce_batch_metadata(
++                    batch_metadata, group=mpu.get_data_parallel_group())
++            else:
++                batch_metadata = _gather_infonce_batch_metadata(batch_metadata)
++        use_metadata_mask = (
++            infonce_mask_fake_negative
++            and bool(batch_metadata)
++            and any(_active_criteria(metadata.get('select_criteria') or {}) for metadata in batch_metadata)
++        )
++
++        if rank == 0 and strtobool(os.environ.get('INFONCE_LOG_METADATA', 'false')):
++            meta_len = len(batch_metadata) if batch_metadata else 0
++            nonempty = sum(1 for m in (batch_metadata or [])
++                           if _active_criteria(m.get('select_criteria') or {}))
++            logger.info(
++                '[infonce] has_metadata=%s meta_len=%s nonempty_criteria=%s '
++                'INFONCE_MASK_FAKE_NEGATIVE=%s use_metadata_mask=%s world_size=%s',
++                batch_metadata is not None,
++                meta_len,
++                nonempty,
++                infonce_mask_fake_negative,
++                use_metadata_mask,
++                world_size,
++            )
++            n_crit = int(os.environ.get('INFONCE_LOG_METADATA_SHOW_SAMPLES', '3'))
++            n_crit = max(0, min(n_crit, 16))
++            if batch_metadata and n_crit > 0:
++                parts = []
++                for i in range(min(n_crit, len(batch_metadata))):
++                    act = _active_criteria(batch_metadata[i].get('select_criteria') or {})
++                    parts.append(f'[{i}]={act!r}')
++                logger.info('[infonce] sample_select_criteria (active): %s', ' | '.join(parts))
++
+         # split tensors into single sample
+         # for example: batch_size=2 with tensor anchor(1)+positive(1)+negatives(3) + anchor(1)+positive(1)+negatives(2)
+         # labels will be [1,0,0,0,1,0,0], meaning 1 positive, 3 negatives, 1 positive, 2 negatives
+         split_tensors = _parse_multi_negative_sentences(sentences, labels, hard_negatives)
++        if use_metadata_mask and len(batch_metadata) != len(split_tensors):
++            raise ValueError(
++                f'InfoNCE metadata count ({len(batch_metadata)}) does not match '
++                f'the query count ({len(split_tensors)})')
++
+         loss = 0
+         can_batched = hard_negatives is not None
+         if hard_negatives is None and len(set([s.shape[0] for s in split_tensors])) == 1:
+@@ -234,30 +433,49 @@ class InfonceLoss(BaseLoss):
+                     logits_list.append(dd_matrix)
+ 
+                 if infonce_mask_fake_negative:
+-                    # thresholds derived from positive q->d scores per row
+-                    row_idx = torch.arange(qd_matrix.size(0), device=qd_matrix.device)
+-                    pos_scores = qd_matrix[row_idx, labels]
+-                    thresholds = pos_scores.view(-1, 1).detach() + fake_neg_margin
+-
+-                    # qd block mask
+-                    qd_block = qd_matrix.clone()
+-                    qd_mask = qd_block > thresholds
+-                    qd_block[qd_mask] = float('-inf')
+-
+-                    components = [qd_block]
+-
+-                    # qq block mask (if present)
+-                    if infonce_include_qq:
+-                        qq_block = qq_matrix.clone()
+-                        qq_mask = qq_block > thresholds
+-                        qq_block[qq_mask] = float('-inf')
+-                        # diagonal already masked unconditionally at construction time
+-                        components.append(qq_block)
+-
+-                    # dd block (if present): self-positive column already masked unconditionally
+-                    if infonce_include_dd:
+-                        # align with Qwen3-Embedding, no threshold masking for d-d
+-                        components.append(dd_matrix)
++                    if use_metadata_mask:
++                        # --- metadata-based masking: mask documents whose metadata
++                        #     satisfies the query's select_criteria ---
++                        block_size = sentences.size(1) - 1  # docs per sample
++                        fn_mask = _build_metadata_fn_mask(batch_metadata, block_size, qd_matrix.device)
++                        if rank == 0 and strtobool(os.environ.get('INFONCE_LOG_METADATA', 'false')):
++                            logger.info('[infonce] metadata_fn_mask true_count=%s (qd_block %s x %s)',
++                                        int(fn_mask.sum().item()), *fn_mask.shape)
++                            n_fn = int(os.environ.get('INFONCE_LOG_METADATA_SHOW_FN', '5'))
++                            n_fn = max(0, min(n_fn, 32))
++                            _log_infonce_masked_fn_batched(batch_metadata, fn_mask, block_size, n_fn)
++                        qd_block = qd_matrix.clone()
++                        qd_block[fn_mask] = float('-inf')
++                        components = [qd_block]
++                        if infonce_include_qq:
++                            components.append(qq_matrix)
++                        if infonce_include_dd:
++                            components.append(dd_matrix)
++                    else:
++                        # thresholds derived from positive q->d scores per row
++                        row_idx = torch.arange(qd_matrix.size(0), device=qd_matrix.device)
++                        pos_scores = qd_matrix[row_idx, labels]
++                        thresholds = pos_scores.view(-1, 1).detach() + fake_neg_margin
++
++                        # qd block mask
++                        qd_block = qd_matrix.clone()
++                        qd_mask = qd_block > thresholds
++                        qd_block[qd_mask] = float('-inf')
++
++                        components = [qd_block]
++
++                        # qq block mask (if present)
++                        if infonce_include_qq:
++                            qq_block = qq_matrix.clone()
++                            qq_mask = qq_block > thresholds
++                            qq_block[qq_mask] = float('-inf')
++                            # diagonal already masked unconditionally at construction time
++                            components.append(qq_block)
++
++                        # dd block (if present): self-positive column already masked unconditionally
++                        if infonce_include_dd:
++                            # align with Qwen3-Embedding, no threshold masking for d-d
++                            components.append(dd_matrix)
+ 
+                     similarity_matrix = torch.cat(components, dim=1)
+                 else:
+@@ -275,6 +493,35 @@ class InfonceLoss(BaseLoss):
+                 # prepare query anchors list if q-q is included
+                 if infonce_include_qq:
+                     queries_all = torch.stack([t[0] for t in split_tensors], dim=0)  # [B, D]
++
++                # pre-build per-query metadata masks for the flat doc tensor
++                if use_metadata_mask:
++                    split_sizes = [t.size(0) - 1 for t in split_tensors]
++                    fn_masks_flat = _build_metadata_fn_mask_flat(batch_metadata, split_sizes, sentences.device)
++                    if rank == 0 and strtobool(os.environ.get('INFONCE_LOG_METADATA', 'false')):
++                        total_true = sum(int(m.sum().item()) for m in fn_masks_flat)
++                        logger.info('[infonce] metadata_fn_mask_flat sum_true=%s n_queries=%s', total_true,
++                                    len(fn_masks_flat))
++                        n_fn = int(os.environ.get('INFONCE_LOG_METADATA_SHOW_FN', '5'))
++                        n_fn = max(0, min(n_fn, 32))
++                        if n_fn > 0 and fn_masks_flat and len(fn_masks_flat) == len(batch_metadata):
++                            flat_meta: List[Dict] = []
++                            for j, meta in enumerate(batch_metadata):
++                                flat_meta.append(meta.get('pos_doc_metadata') or {})
++                                for neg_meta in (meta.get('neg_doc_metadata') or []):
++                                    flat_meta.append(neg_meta)
++                            q_idx = 0
++                            m0 = fn_masks_flat[q_idx]
++                            if m0.any():
++                                nz0 = m0.nonzero(as_tuple=False).reshape(-1)
++                                crit0 = _active_criteria(batch_metadata[q_idx].get('select_criteria') or {})
++                                for t in range(min(n_fn, nz0.numel())):
++                                    pos = int(nz0[t].item())
++                                    dm = flat_meta[pos] if pos < len(flat_meta) else {}
++                                    logger.info(
++                                        '[infonce] masked_fn_flat: query=%s flat_doc_idx=%s criteria_active=%r doc_meta=%r',
++                                        q_idx, pos, crit0, dm)
++
+                 length = 0
+                 for idx, tensor in enumerate(split_tensors):
+                     # [D] * [B*(neg+1), D], neg numbers are different
+@@ -287,8 +534,12 @@ class InfonceLoss(BaseLoss):
+ 
+                     # qd part with masking
+                     if infonce_mask_fake_negative:
+-                        qd_masked = torch.where(qd_vec > threshold, torch.tensor(float('-inf'), device=qd_vec.device),
+-                                                qd_vec)
++                        if use_metadata_mask:
++                            qd_masked = qd_vec.clone()
++                            qd_masked[fn_masks_flat[idx]] = float('-inf')
++                        else:
++                            qd_masked = torch.where(qd_vec > threshold, torch.tensor(float('-inf'), device=qd_vec.device),
++                                                    qd_vec)
+                     else:
+                         qd_masked = qd_vec
+                     logits_parts.append(qd_masked)
+@@ -299,7 +550,7 @@ class InfonceLoss(BaseLoss):
+                         # exclude self
+                         qq_vec = qq_vec.clone()
+                         qq_vec[idx] = float('-inf')
+-                        if infonce_mask_fake_negative:
++                        if infonce_mask_fake_negative and not use_metadata_mask:
+                             qq_vec = torch.where(qq_vec > threshold, torch.tensor(float('-inf'), device=qq_vec.device),
+                                                  qq_vec)
+                         logits_parts.append(qq_vec)
+diff --git a/swift/model/constant.py b/swift/model/constant.py
+index c726b1c09..c5e9a98d9 100644
+--- a/swift/model/constant.py
++++ b/swift/model/constant.py
+@@ -141,6 +141,7 @@ class MLLMModelType:
+     qwen2_vl = 'qwen2_vl'
+     qwen2_5_vl = 'qwen2_5_vl'
+     qwen2_5_omni = 'qwen2_5_omni'
++    iris_qwen25omni = 'iris_qwen25omni'
+     qwen3_omni_moe = 'qwen3_omni_moe'
+     qwen2_audio = 'qwen2_audio'
+     qwen3_asr = 'qwen3_asr'
+@@ -150,6 +151,7 @@ class MLLMModelType:
+     qwen3_vl_reranker = 'qwen3_vl_reranker'
+     qwen3_5 = 'qwen3_5'
+     qwen3_5_moe = 'qwen3_5_moe'
++    iris_gemma4 = 'iris_gemma4'
+ 
+     qwen2_gme = 'qwen2_gme'
+     ovis1_6 = 'ovis1_6'
+diff --git a/swift/model/model_arch.py b/swift/model/model_arch.py
+index 29c0ec6a1..4d3e331f4 100644
+--- a/swift/model/model_arch.py
++++ b/swift/model/model_arch.py
+@@ -30,6 +30,7 @@ class MLLMModelArch:
+     qwen2_vl = 'qwen2_vl'
+     qwen2_audio = 'qwen2_audio'
+     qwen2_5_omni = 'qwen2_5_omni'
++    qwen2_5_omni_thinker = 'qwen2_5_omni_thinker'
+     qwen3_vl = 'qwen3_vl'
+     qwen3_omni = 'qwen3_omni'
+     qwen3_asr = 'qwen3_asr'
+@@ -593,6 +594,14 @@ register_model_arch(
+         generator=['talker', 'token2wav'],
+     ))
+ 
++register_model_arch(
++    MultiModelKeys(
++        MLLMModelArch.qwen2_5_omni_thinker,
++        language_model=['model', 'lm_head'],
++        vision_tower=['audio_tower', 'visual'],
++        aligner=['audio_tower.proj', 'visual.merger'],
++    ))
++
+ register_model_arch(
+     MultiModelKeys(
+         MLLMModelArch.qwen3_omni,
+diff --git a/swift/model/models/gemma.py b/swift/model/models/gemma.py
+index ccf3325d4..addaf6e52 100644
+--- a/swift/model/models/gemma.py
++++ b/swift/model/models/gemma.py
+@@ -1,9 +1,10 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
++from types import MethodType
++
++from PIL import Image
+ import torch
+ import torch.distributed as dist
+-from PIL import Image
+ from transformers import PreTrainedModel
+-from types import MethodType
+ 
+ from swift.template import TemplateType
+ from swift.utils import is_deepspeed_enabled, to_device
+@@ -204,6 +205,23 @@ register_model(
+     ))
+ 
+ 
++def _fix_dead_mask_rows(mask_mapping):
++    # Padded sliding-window queries can have no visible keys, causing NaN gradients
++    # in fused SDPA backward. Unmask only those dead rows; their outputs occur at pad
++    # positions and are discarded by last-valid-token pooling.
++    if not isinstance(mask_mapping, dict):
++        return mask_mapping
++    for key, mask in mask_mapping.items():
++        if not isinstance(mask, torch.Tensor):
++            continue
++        if mask.dtype == torch.bool:
++            mask_mapping[key] = mask | ~mask.any(dim=-1, keepdim=True)
++        elif mask.is_floating_point():
++            dead = (mask == torch.finfo(mask.dtype).min).all(dim=-1, keepdim=True)
++            mask_mapping[key] = mask.masked_fill(dead, 0)
++    return mask_mapping
++
++
+ def _patch_gemma4_forward(model, processor):
+     from transformers.models.gemma4.modeling_gemma4 import (Gemma4ModelOutputWithPast, create_causal_mask_mapping,
+                                                             create_masks_for_generate, torch_compilable_check)
+@@ -368,6 +386,7 @@ def _patch_gemma4_forward(model, processor):
+                     past_key_values,
+                     position_ids,
+                 )
++        causal_mask_mapping = _fix_dead_mask_rows(causal_mask_mapping)
+         kwargs.pop('return_dict', None)
+         outputs = self.language_model(
+             per_layer_inputs=per_layer_inputs,
+@@ -399,10 +418,53 @@ class Gemma4Loader(ModelLoader):
+         from transformers import Gemma4ForConditionalGeneration
+         self.auto_model_cls = self.auto_model_cls or Gemma4ForConditionalGeneration
+         model = super().get_model(model_dir, config, processor, model_kwargs)
++        # The audio tower's chunked local attention requires the 4-D sdpa/eager mask:
++        # under flash_attention_2 create_bidirectional_mask returns a 2-D mask, which
++        # _convert_4d_mask_to_blocked_5d cannot unpack -> ValueError on any padded
++        # audio batch. Force sdpa for the audio tower only; the LM keeps --attn_impl.
++        model.model.audio_tower.set_attn_implementation('sdpa')
+         _patch_gemma4_forward(model.model, processor)
+         return model
+ 
+ 
++class Gemma4EmbeddingLoader(Gemma4Loader):
++
++    def __init__(self, *args, audio_layer_aggregation=None, audio_layer_index=None, train_audio_projection=None,
++                 audio_weight_backend=None, audio_weight_text_model=None, audio_weight_text_revision=None,
++                 audio_weight_init_final_prob=None,
++                 train_audio_weight_text_encoder=None, audio_weight_document_text=None, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.audio_aggregation_kwargs = {
++            'audio_layer_aggregation': audio_layer_aggregation,
++            'audio_layer_index': audio_layer_index,
++            'train_audio_projection': train_audio_projection,
++            'audio_weight_backend': audio_weight_backend,
++            'audio_weight_init_final_prob': audio_weight_init_final_prob,
++            'audio_weight_text_model': audio_weight_text_model,
++            'audio_weight_text_revision': audio_weight_text_revision,
++            'train_audio_weight_text_encoder': train_audio_weight_text_encoder,
++            'audio_weight_document_text': audio_weight_document_text,
++        }
++
++    def get_config(self, model_dir):
++        from iris.embed.modeling.audio_layer_backends import apply_audio_aggregation_config
++        config = super().get_config(model_dir)
++        apply_audio_aggregation_config(config, **self.audio_aggregation_kwargs)
++        return config
++
++    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
++        from iris.embed.modeling.audio_layer_backends import initialize_audio_layer_weight_module, is_iris_checkpoint
++        from iris.embed.modeling.audio_weight_inputs import load_audio_weight_tokenizer
++        from iris.embed.modeling.modeling_iris_gemma4 import IrisGemma4ForConditionalGeneration
++        self.auto_model_cls = self.auto_model_cls or IrisGemma4ForConditionalGeneration
++        model = super().get_model(model_dir, config, processor, model_kwargs)
++        if not is_iris_checkpoint(config):
++            initialize_audio_layer_weight_module(model)
++        # Cache the router tokenizer before offline DataLoader workers start.
++        load_audio_weight_tokenizer(config)
++        return model
++
++
+ register_model(
+     ModelMeta(
+         MLLMModelType.gemma4,
+@@ -427,3 +489,22 @@ register_model(
+         model_arch=ModelArch.gemma3n,
+         requires=['transformers>=4.53'],
+     ))
++
++
++register_model(
++    ModelMeta(
++        MLLMModelType.iris_gemma4,
++        [
++            ModelGroup([
++                Model('google/gemma-4-E2B', 'google/gemma-4-E2B'),
++                Model('google/gemma-4-E2B-it', 'google/gemma-4-E2B-it'),
++                Model('google/gemma-4-E4B', 'google/gemma-4-E4B'),
++                Model('google/gemma-4-E4B-it', 'google/gemma-4-E4B-it'),
++            ]),
++        ],
++        Gemma4EmbeddingLoader,
++        template=TemplateType.gemma4_emb,
++        architectures=['IrisGemma4ForConditionalGeneration'],
++        model_arch=ModelArch.gemma3n,
++        requires=['transformers==5.8.1'],
++    ))
+diff --git a/swift/model/models/qwen.py b/swift/model/models/qwen.py
+index 4a6d30f43..c4e6bab8f 100644
+--- a/swift/model/models/qwen.py
++++ b/swift/model/models/qwen.py
+@@ -1546,6 +1546,69 @@ register_model(
+     ))
+ 
+ 
++class Qwen2_5OmniThinkerLoader(Qwen2_5OmniLoader):
++
++    def __init__(self, *args, audio_layer_aggregation=None, audio_layer_index=None, train_audio_projection=None,
++                 audio_weight_backend=None, audio_weight_text_model=None, audio_weight_text_revision=None,
++                 audio_weight_init_final_prob=None,
++                 train_audio_weight_text_encoder=None, audio_weight_document_text=None, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.audio_aggregation_kwargs = {
++            'audio_layer_aggregation': audio_layer_aggregation,
++            'audio_layer_index': audio_layer_index,
++            'train_audio_projection': train_audio_projection,
++            'audio_weight_backend': audio_weight_backend,
++            'audio_weight_init_final_prob': audio_weight_init_final_prob,
++            'audio_weight_text_model': audio_weight_text_model,
++            'audio_weight_text_revision': audio_weight_text_revision,
++            'train_audio_weight_text_encoder': train_audio_weight_text_encoder,
++            'audio_weight_document_text': audio_weight_document_text,
++        }
++
++    def get_config(self, model_dir):
++        from transformers import Qwen2_5OmniThinkerConfig
++        from iris.embed.modeling.audio_layer_backends import apply_audio_aggregation_config
++        self._check_qwen_omni_utils()
++        self.auto_config_cls = Qwen2_5OmniThinkerConfig
++        config = ModelLoader.get_config(self, model_dir)
++        apply_audio_aggregation_config(config, **self.audio_aggregation_kwargs)
++        return config
++
++    def get_model(self, model_dir, config, processor, model_kwargs):
++        from iris.embed.modeling.audio_layer_backends import initialize_audio_layer_weight_module, is_iris_checkpoint
++        from iris.embed.modeling.audio_weight_inputs import load_audio_weight_tokenizer
++        from iris.embed.modeling.modeling_iris_qwen25omni import IrisQwen2_5OmniThinkerForConditionalGeneration
++        self.auto_model_cls = self.auto_model_cls or IrisQwen2_5OmniThinkerForConditionalGeneration
++        model = ModelLoader.get_model(self, model_dir, config, processor, model_kwargs)
++        base_model = model.model if 'AWQ' in model.__class__.__name__ else model
++        if not is_iris_checkpoint(config):
++            initialize_audio_layer_weight_module(base_model)
++        # Cache the router tokenizer before offline DataLoader workers start.
++        load_audio_weight_tokenizer(config)
++        base_model.config.keys_to_ignore_at_inference += ['hidden_states', 'attention_mask']
++        patch_get_input_embeddings(base_model.visual, 'patch_embed')
++        return model
++
++
++register_model(
++    ModelMeta(
++        MLLMModelType.iris_qwen25omni,
++        [
++            ModelGroup([
++                Model('Qwen/Qwen2.5-Omni-3B', 'Qwen/Qwen2.5-Omni-3B'),
++                Model('Qwen/Qwen2.5-Omni-7B', 'Qwen/Qwen2.5-Omni-7B'),
++            ]),
++        ],
++        Qwen2_5OmniThinkerLoader,
++        template=TemplateType.qwen2_5_omni_emb,
++        model_arch=ModelArch.qwen2_5_omni_thinker,
++        architectures=['IrisQwen2_5OmniThinkerForConditionalGeneration'],
++        requires=['transformers==5.8.1', 'soundfile', 'qwen_omni_utils'],
++        tags=['vision', 'video', 'audio'],
++        ignore_patterns=[],
++    ))
++
++
+ def _compat_qwen3_omni_mixed_data(model, processor):
+     if hasattr(model, 'origin_forward'):
+         return
+diff --git a/swift/model/patcher.py b/swift/model/patcher.py
+index d7c6d55bd..43f2d136b 100644
+--- a/swift/model/patcher.py
++++ b/swift/model/patcher.py
+@@ -86,6 +86,20 @@ def patch_output_normalizer(module: torch.nn.Module, model_meta):
+ 
+     assert found, 'Cannot find the proper lm_head name'
+ 
++    # With lm_head replaced by identity above, any transform the base model's
++    # forward applies AFTER lm_head would be applied to the hidden state we pool as the
++    # embedding. Notably Gemma's `final_logit_softcapping` (e.g. 30.0) would make the
++    # pooled vector `softcap(hidden)` instead of `hidden` -- distorting it and mismatching
++    # inference, which reads raw `hidden_states`. Embeddings need the raw last hidden state,
++    # so disable final_logit_softcapping on the (text) config. No-op for models without it.
++    config = getattr(module, 'config', None)
++    get_text_config = getattr(config, 'get_text_config', None)
++    _text_cfg = get_text_config() if callable(get_text_config) else config
++    if _text_cfg is not None and getattr(_text_cfg, 'final_logit_softcapping', None) is not None:
++        logger.info('patch_output_normalizer: disabling final_logit_softcapping=%s (embedding pools raw hidden state)',
++                    _text_cfg.final_logit_softcapping)
++        _text_cfg.final_logit_softcapping = None
++
+     def _output_embedding_hook(module, args, kwargs, output):
+         attention_mask = kwargs.get('attention_mask', None)
+         hidden_states = output.logits
+diff --git a/swift/pipelines/train/tuner.py b/swift/pipelines/train/tuner.py
+index 3fafaed13..35a50db50 100644
+--- a/swift/pipelines/train/tuner.py
++++ b/swift/pipelines/train/tuner.py
+@@ -110,6 +110,14 @@ def get_target_modules(args, model) -> Union[str, List[str]]:
+     return target_modules
+ 
+ 
++def _module_is_already_saved(module_name, modules_to_save):
++    while module_name:
++        if any(module_name.endswith(saved_module) for saved_module in modules_to_save):
++            return True
++        module_name = module_name.rpartition('.')[0]
++    return False
++
++
+ def get_modules_to_save(args, model, task_type=None):
+     modules_to_save = args.modules_to_save.copy()
+     if 'all-embedding' in args.modules_to_save:
+@@ -120,6 +128,32 @@ def get_modules_to_save(args, model, task_type=None):
+         modules_to_save += find_norm(model)
+     if task_type and task_type.lower() == 'seq_cls':  # reward_model
+         modules_to_save.append('v_head')
++    aggregation = getattr(model.config, 'audio_layer_aggregation', 'final')
++    if aggregation == 'learned':
++        if (
++            getattr(model.config, 'audio_weight_backend', 'minilm') == 'minilm'
++            and not getattr(model.config, 'train_audio_weight_text_encoder', False)
++        ):
++            modules_to_save += [
++                'audio_layer_weight_module.norm',
++                'audio_layer_weight_module.output_projection',
++            ]
++        else:
++            modules_to_save.append('audio_layer_weight_module')
++    if getattr(model.config, 'train_audio_projection', False):
++        if hasattr(model, 'audio_tower'):
++            projection_modules = ['audio_tower.ln_post', 'audio_tower.proj']
++        elif hasattr(model, 'model') and hasattr(model.model, 'audio_tower'):
++            projection_modules = [
++                'model.audio_tower.output_proj',
++                'model.embed_audio.embedding_pre_projection_norm',
++                'model.embed_audio.embedding_projection',
++            ]
++        else:
++            projection_modules = []
++        for module_name in projection_modules:
++            if not _module_is_already_saved(module_name, modules_to_save):
++                modules_to_save.append(module_name)
+     return modules_to_save
+ 
+ 
+@@ -363,6 +397,8 @@ class TunerMixin:
+                 else:
+                     model = prepare_adapter(
+                         args, model, template=template, train_dataset=train_dataset, task_type=task_type)
++            # PEFT enables modules_to_save; apply explicit freezes afterwards.
++            freeze_parameters(model, args.freeze_parameters_ratio, args.freeze_parameters, args.freeze_parameters_regex)
+             # fix bug: Attempting to unscale FP16 gradients.
+             #   peft: https://github.com/huggingface/peft/issues/1249
+             for p in model.parameters():
+diff --git a/swift/template/base.py b/swift/template/base.py
+index 0bae8e31a..1152e9906 100644
+--- a/swift/template/base.py
++++ b/swift/template/base.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
+ import hashlib
+ import inspect
++import json
+ import math
+ import os
+ import random
+@@ -17,12 +18,12 @@ from modelscope.hub.utils.utils import get_cache_dir
+ from peft import PeftModel
+ from PIL import Image
+ from torch.nn.utils.rnn import pad_sequence
+-from transformers import StoppingCriteriaList
++from transformers import AutoTokenizer, StoppingCriteriaList
+ from transformers.integrations import is_deepspeed_zero3_enabled
+ from transformers.utils import strtobool
+ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+ 
+-from swift.utils import Processor, ProcessorMixin, get_env_args, get_logger, remove_response, retry_decorator, to_device
++from swift.utils import Processor, ProcessorMixin, get_env_args, get_logger, retry_decorator, to_device
+ from .template_inputs import StdTemplateInputs, TemplateInputs
+ from .utils import Context, ContextType, StopWordsCriteria, fetch_one, findall, get_last_user_round, split_str_parts_by
+ from .vision_utils import _check_path, load_audio, load_batch, load_image, rescale_image
+@@ -33,6 +34,27 @@ if TYPE_CHECKING:
+     from .template_meta import TemplateMeta
+ 
+ 
++_EMBEDDING_METADATA_TYPES = {
++    'select_criteria': dict,
++    'pos_doc_metadata': dict,
++    'neg_doc_metadata': list,
++}
++
++
++def _parse_embedding_metadata(value, field: str):
++    if value is None:
++        return None
++    if isinstance(value, str):
++        value = json.loads(value)
++
++    expected_type = _EMBEDDING_METADATA_TYPES[field]
++    if not isinstance(value, expected_type):
++        raise ValueError(f'Invalid {field}: expected {expected_type.__name__}, got {type(value).__name__}')
++    if field == 'neg_doc_metadata' and not all(isinstance(item, dict) for item in value):
++        raise ValueError('Invalid neg_doc_metadata: expected a list of dictionaries')
++    return value
++
++
+ class MaxLengthError(ValueError):
+     pass
+ 
+@@ -482,6 +504,15 @@ class Template(ProcessorMixin):
+                 labels.append(0.0)
+ 
+             _encoded['labels'] = labels
++
++            # Carry metadata through to the embedding collator for false-negative masking.
++            for meta_key in ('select_criteria', 'pos_doc_metadata', 'neg_doc_metadata'):
++                val = anchor.extra_kwargs.get(meta_key)
++                if val is not None:
++                    _encoded[meta_key] = val
++            audio_weight_text = anchor.extra_kwargs.get('audio_weight_text')
++            if audio_weight_text is not None:
++                _encoded['audio_weight_text'] = audio_weight_text
+         else:
+             anchor = inputs.chosen
+             _encoded = self._encode_truncated(anchor)
+@@ -1684,7 +1715,20 @@ class Template(ProcessorMixin):
+                                  padding_to: Optional[int] = None) -> Dict[str, Any]:
+         labels = []
+         new_batch = []
++        audio_weight_texts = []
++        use_minilm_router = (
++            getattr(self.config, 'audio_layer_aggregation', 'final') == 'learned'
++            and getattr(self.config, 'audio_weight_backend', 'minilm') == 'minilm'
++        )
++        if use_minilm_router:
++            from iris.embed.modeling.embedding_prompt import query_router_text
++        _meta_keys = ('select_criteria', 'pos_doc_metadata', 'neg_doc_metadata')
++        batch_metadata = []
+         for b in batch:
++            audio_weight_text = b.pop('audio_weight_text', None)
++            raw = {k: _parse_embedding_metadata(b.pop(k, None), k) for k in _meta_keys}
++            batch_metadata.append(raw)
++
+             if 'input_ids' in b:
+                 new_batch += [b]
+             else:
+@@ -1704,12 +1748,39 @@ class Template(ProcessorMixin):
+                         indexes.append(f'negative{i}_')
+                 for prefix in indexes:
+                     new_batch += self._fetch_inputs_startswith([b], prefix)
++                if use_minilm_router and audio_weight_text is not None:
++                    audio_weight_texts.append(query_router_text(audio_weight_text))
++                    audio_weight_texts.extend(
++                        [self.config.audio_weight_document_text] * (len(indexes) - 1))
+             labels.extend(b.get('labels', []))
+         num_samples = len(new_batch)
+         res = self._data_collator(new_batch, padding_to=padding_to)
+         res['num_samples'] = num_samples
+         if labels:
+             res['labels'] = torch.tensor(labels, dtype=torch.float32)
++
++        if use_minilm_router:
++            if len(audio_weight_texts) != num_samples:
++                raise ValueError('MiniLM audio routing requires one instruction per embedding sample')
++            tokenizer = getattr(self, '_audio_weight_tokenizer', None)
++            if tokenizer is None:
++                # Workers restart between epochs; load the cached tokenizer without Hub requests.
++                tokenizer = AutoTokenizer.from_pretrained(
++                    self.config.audio_weight_text_model,
++                    revision=getattr(self.config, 'audio_weight_text_revision', None),
++                    local_files_only=True)
++                self._audio_weight_tokenizer = tokenizer
++            weight_inputs = tokenizer(
++                audio_weight_texts, padding=True, truncation=True, return_tensors='pt')
++            res['audio_weight_input_ids'] = weight_inputs['input_ids']
++            res['audio_weight_attention_mask'] = weight_inputs['attention_mask']
++
++        # Staged for InfoNCE metadata masking; Trainer._prepare_inputs forwards this to
++        # set_infonce_batch_metadata (survives DataLoader multiprocessing workers).
++        if batch_metadata:
++            from swift.loss.embedding import INFONCE_BATCH_METADATA_KEY
++            res[INFONCE_BATCH_METADATA_KEY] = batch_metadata
++
+         return res
+ 
+     def _reranker_data_collator(self,
+diff --git a/swift/template/constant.py b/swift/template/constant.py
+index 88e84674d..e2bddfdf6 100644
+--- a/swift/template/constant.py
++++ b/swift/template/constant.py
+@@ -137,6 +137,7 @@ class MLLMTemplateType:
+     qwen2_vl = 'qwen2_vl'
+     qwen2_5_vl = 'qwen2_5_vl'
+     qwen2_5_omni = 'qwen2_5_omni'
++    qwen2_5_omni_emb = 'qwen2_5_omni_emb'
+     qwen3_omni = 'qwen3_omni'
+     qwen2_audio = 'qwen2_audio'
+     qwen3_asr = 'qwen3_asr'
+@@ -256,6 +257,7 @@ class MLLMTemplateType:
+     gemma3n = 'gemma3n'
+     gemma4 = 'gemma4'
+     gemma4_nothinking = 'gemma4_nothinking'
++    gemma4_emb = 'gemma4_emb'
+     mistral_2503 = 'mistral_2503'
+     mistral_2506 = 'mistral_2506'
+     mistral_2512 = 'mistral_2512'
+diff --git a/swift/template/templates/gemma.py b/swift/template/templates/gemma.py
+index ea35c592f..0b4e554b6 100644
+--- a/swift/template/templates/gemma.py
++++ b/swift/template/templates/gemma.py
+@@ -353,3 +353,25 @@ register_template(
+         template_cls=Gemma4Template,
+         is_thinking=True,
+         non_thinking_prefix='<|channel>thought\n<channel|>'))
++
++
++# Instruction-aware speech embedding template for Gemma 4 (E2B/E4B/...).
++# Mirrors qwen2_5_omni_emb: append an empty model turn so the encoded sequence ends
++# at "<|turn>model\n" (suffix=[] so no trailing "<turn|>\n"), making the last real
++# token identical between training and inference (apply_chat_template with
++# add_generation_prompt=True). No thinking/channel prefix is added (plain Gemma4Template).
++class Gemma4EmbTemplate(Gemma4Template):
++
++    def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
++        super()._preprocess_inputs(inputs)
++        if len(inputs.messages) % 2 == 1 and inputs.messages[-1]['role'] != 'assistant':
++            inputs.messages.append({'role': 'assistant', 'content': ''})
++
++
++register_template(
++    Gemma4TemplateMeta(
++        MLLMTemplateType.gemma4_emb,
++        template_cls=Gemma4EmbTemplate,
++        default_system=None,
++        suffix=[],
++    ))
+diff --git a/swift/template/templates/qwen.py b/swift/template/templates/qwen.py
+index 9b235fdf3..3b9644418 100644
+--- a/swift/template/templates/qwen.py
++++ b/swift/template/templates/qwen.py
+@@ -692,6 +692,26 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
+         self.use_audio_in_video = get_env_args('use_audio_in_video', bool, False)
+         self.sampling_rate = get_env_args('sampling_rate', int, self.processor.feature_extractor.sampling_rate)
+ 
++    def register_post_encode_hook(self, models) -> None:
++        super().register_post_encode_hook(models)
++        for model, handle in self._handles:
++            thinker, _ = self._get_thinker_and_config(model)
++            if thinker is model and hasattr(thinker, 'prepare_audio_layer_weights'):
++                # Full tuning puts both hooks on the thinker. Encode audio before
++                # its inference hook consumes the MiniLM instruction tokens.
++                model._forward_pre_hooks.move_to_end(handle.id, last=False)
++
++    def _get_thinker_and_config(self, model):
++        """Return the thinker module and config for full and thinker-only Omni models."""
++        base = self.get_base_model(model)
++        if hasattr(base, 'thinker') and getattr(base, 'thinker', None) is not None:
++            thinker = base.thinker
++            config = getattr(base.config, 'thinker_config', base.config)
++        else:
++            thinker = base
++            config = base.config
++        return thinker, config
++
+     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
+                     inputs: StdTemplateInputs) -> List[Context]:
+         from qwen_omni_utils import fetch_image, fetch_video
+@@ -819,7 +839,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
+         input_ids = encoded['input_ids']
+         labels = encoded['labels']
+         loss_scale = encoded.get('loss_scale', None)
+-        config = self.config.thinker_config
++        config = getattr(self.config, 'thinker_config', self.config)
+         # audio
+         if self.version == 'omni_v3':
+             audio_token_id = [config.audio_token_id]
+@@ -889,24 +909,31 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
+         input_features = inputs.get('input_features')
+         feature_attention_mask = inputs.get('feature_attention_mask')
+ 
+-        base_model = self.get_base_model(model)
+-        inputs_embeds = base_model.thinker.model.embed_tokens(input_ids)
+-        thinker_config = model.config.thinker_config
+-        inputs_embeds = self._get_inputs_embeds_hf(inputs_embeds, inputs, model.thinker.visual, self.processor,
++        thinker, thinker_config = self._get_thinker_and_config(model)
++        if input_features is not None and hasattr(thinker, 'prepare_audio_layer_weights'):
++            thinker.prepare_audio_layer_weights(
++                input_ids,
++                inputs.get('attention_mask'),
++                inputs.get('position_ids'),
++                inputs.get('audio_weight_input_ids'),
++                inputs.get('audio_weight_attention_mask'),
++            )
++        inputs_embeds = thinker.model.embed_tokens(input_ids)
++        inputs_embeds = self._get_inputs_embeds_hf(inputs_embeds, inputs, thinker.visual, self.processor,
+                                                    thinker_config)
+         if input_features is None:
+             if is_deepspeed_enabled() and not is_deepspeed_zero3_enabled():
+                 # Note: ZeRO-3 still results in hangs; for audio training, please use ZeRO-2.
+-                input_features = input_ids.new_zeros([1, 128, 128], dtype=model.thinker.audio_tower.dtype)
++                input_features = input_ids.new_zeros([1, 128, 128], dtype=thinker.audio_tower.dtype)
+                 feature_attention_mask = input_ids.new_ones([1, 128], dtype=torch.bool)
+-                audio_res = model.thinker.get_audio_features(input_features, feature_attention_mask)
++                audio_res = thinker.get_audio_features(input_features, feature_attention_mask)
+                 if hasattr(audio_res, 'last_hidden_state'):
+                     audio_embeds = audio_res.last_hidden_state
+                 else:
+                     audio_embeds = audio_res
+                 inputs_embeds = inputs_embeds + audio_embeds.mean() * 0.
+         else:
+-            audio_res = model.thinker.get_audio_features(input_features, feature_attention_mask)
++            audio_res = thinker.get_audio_features(input_features, feature_attention_mask)
+             if hasattr(audio_res, 'last_hidden_state'):
+                 audio_embeds = audio_res.last_hidden_state
+             else:
+@@ -935,7 +962,9 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
+             attention_mask = inputs.get('attention_mask')
+         if attention_mask is None:
+             attention_mask = torch.ones_like(input_ids)
+-        position_ids, _ = self._get_get_rope_index()(
++
++        thinker, _ = self._get_thinker_and_config(self._get_model())
++        position_ids, _ = thinker.get_rope_index(
+             input_ids,
+             inputs.get('image_grid_thw'),
+             inputs.get('video_grid_thw'),
+@@ -977,6 +1006,24 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
+ register_template(QwenTemplateMeta(MLLMTemplateType.qwen2_5_omni, template_cls=Qwen2_5OmniTemplate))
+ 
+ 
++class Qwen2_5OmniEmbTemplate(Qwen2_5OmniTemplate):
++
++    def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
++        super()._preprocess_inputs(inputs)
++        if len(inputs.messages) % 2 == 1 and inputs.messages[-1]['role'] != 'assistant':
++            inputs.messages.append({'role': 'assistant', 'content': ''})
++
++
++register_template(
++    QwenTemplateMeta(
++        MLLMTemplateType.qwen2_5_omni_emb,
++        default_system=None,
++        prompt=['<|im_start|>user\n{{QUERY}}<|im_end|>\n<|im_start|>assistant\n'],
++        suffix=[],
++        template_cls=Qwen2_5OmniEmbTemplate,
++    ))
++
++
+ class Qwen3OmniTemplate(Qwen2_5OmniTemplate):
+     version = 'omni_v3'
+     norm_bbox = 'norm1000'
+diff --git a/swift/trainers/embedding_trainer.py b/swift/trainers/embedding_trainer.py
+index e381982ec..e0407eb20 100644
+--- a/swift/trainers/embedding_trainer.py
++++ b/swift/trainers/embedding_trainer.py
+@@ -1,4 +1,6 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
++
++from swift.loss.embedding import INFONCE_BATCH_METADATA_KEY, clear_infonce_batch_metadata, set_infonce_batch_metadata
+ from swift.utils import get_logger
+ from .trainer import Trainer
+ from .utils import gather_for_unpadded_tensors
+@@ -12,6 +14,20 @@ class EmbeddingTrainer(Trainer):
+         super().__init__(*args, **kwargs)
+         self.gather_function = gather_for_unpadded_tensors
+ 
++    def _prepare_inputs(self, inputs):
++        inputs = super()._prepare_inputs(inputs)
++        # Embedding InfoNCE: metadata must be staged on the training process (not only in
++        # DataLoader workers); the collator puts it on the batch dict under this key.
++        if INFONCE_BATCH_METADATA_KEY in inputs:
++            meta = inputs.pop(INFONCE_BATCH_METADATA_KEY)
++            if meta is not None:
++                set_infonce_batch_metadata(meta)
++            else:
++                clear_infonce_batch_metadata()
++        else:
++            clear_infonce_batch_metadata()
++        return inputs
++
+     def evaluation_loop(self, *args, **kwargs):
+         output = super().evaluation_loop(*args, **kwargs)
+         self.gather_function = gather_for_unpadded_tensors
