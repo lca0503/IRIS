@@ -4,6 +4,8 @@ This repository contains the code, checkpoints, and experiments for IRIS.
 
 ## IRIS-Embed
 
+[![arXiv](https://img.shields.io/badge/arXiv-2611.09122-b31b1b?logo=arXiv)](https://arxiv.org/abs/2611.09122)
+
 IRIS-Embed is a speech embedding model for instruction-aware retrieval.
 The query instruction specifies what to retrieve.
 Documents are encoded without a query instruction.
@@ -78,3 +80,16 @@ Inference and evaluation use Hugging Face checkpoints and do not need ms-swift.
 
 Install `python -m pip install -e '.[experiments]'` for INSPIRE and its analyses.
 Use a separate environment with `python -m pip install -e '.[maeb]'` for MAEB.
+
+## Citation
+
+If you find our code or models helpful, please consider citing our paper using the following BibTeX:
+
+```bibtex
+@article{li2026improving,
+  title   = {Improving Large Audio-Language Model Embedding Baselines for Instruction-Aware Speech Retrieval},
+  author  = {Li, Chen-An and Chiang, Cheng-Han and Lee, Hung-yi},
+  journal = {arXiv preprint arXiv:2611.09122},
+  year    = {2026}
+}
+```
